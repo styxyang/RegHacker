@@ -38,6 +38,9 @@
 
 #define IOCTL_GETADDR CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 
+static HANDLE hUserEvent = NULL;
+static PKEVENT pEvent = NULL;
+
 void RegHackerUnload(IN PDRIVER_OBJECT DriverObject);
 NTSTATUS RegHackerCreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
 NTSTATUS RegHackerDefaultHandler(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
@@ -54,14 +57,6 @@ NTSYSAPI NTSTATUS NTAPI ZwQueryInformationProcess(
 );
 
 /* Export SSDT structure */
-typedef struct _deviceExtension
-{
-	PDEVICE_OBJECT DeviceObject;
-	PDEVICE_OBJECT TargetDeviceObject;
-	PDEVICE_OBJECT PhysicalDeviceObject;
-	UNICODE_STRING DeviceInterface;
-} RegHacker_DEVICE_EXTENSION, *PRegHacker_DEVICE_EXTENSION;
-
 typedef struct _SERVICE_DESCRIPTOR_TABLE
 {
     unsigned int *ServiceTableBase;
@@ -124,7 +119,7 @@ NTSTATUS NewZwOpenKey(
         ACCESS_MASK DesiredAccess,
         POBJECT_ATTRIBUTES ObjectAttributes)
 {
-        /* KDBG("Someone opened a key\n"); */
+        /* KDBG("Someone opened a key"); */
         return RealZwOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 }
 
@@ -144,7 +139,7 @@ NTSTATUS NewZwCreateKey(
         ULONG idx;
         ANSI_STRING aStr;
 
-        KDBG("Hijack ZwCreateKey\n");
+        KDBG("Hijack ZwCreateKey");
 
         /* current = PsGetCurrentProcess(); */
         
@@ -156,12 +151,12 @@ NTSTATUS NewZwCreateKey(
                                   0,
                                   &retLen);
         bufLen = retLen - sizeof(UNICODE_STRING);
-        KDBG("buflen: %lx %lx\n", retLen, bufLen);
+        KDBG("buflen: %lx %lx", retLen, bufLen);
         buffer = ExAllocatePool(NonPagedPool, retLen);
         if (NULL == buffer) {
                 goto real;
         }
-        KDBG("before query\n");
+        KDBG("before query");
         status = ZwQueryInformationProcess(NtCurrentProcess(),
                                            ProcessImageFileName,
                                            buffer,
@@ -176,8 +171,41 @@ NTSTATUS NewZwCreateKey(
         RtlUnicodeStringToAnsiString(&aStr, (PUNICODE_STRING)buffer, TRUE);
         KDBG("%s\n", aStr.Buffer);
         RtlFreeAnsiString(&aStr);
-        /* } */
         ExFreePool(buffer);
+
+        /* convert user handle into event object */
+        /* always use the ObReferenceObjectByHandle to access opaque object
+         * SHOULDN'T store it pEvent in an long-term-use variables
+         * because the userspace may close the handle and reference it in kernel
+         * will make you understand */
+        if (NULL == hUserEvent) {
+                KDBG("User event handle not available");
+                goto real;
+        }
+         /* Drivers should always specify *UserMode* for handles they receive
+          * from user address space. -- From MSDN */
+        status = ObReferenceObjectByHandle(hUserEvent,
+                                           EVENT_MODIFY_STATE,
+                                           *ExEventObjectType,
+                                           UserMode,
+                                           (PVOID*)&pEvent,
+                                           NULL);
+        if (status != STATUS_SUCCESS) {
+                if (status == STATUS_OBJECT_TYPE_MISMATCH) {
+                        KDBG("User event handle has wrong type");
+                }
+                if (status == STATUS_INVALID_HANDLE) {
+                        KDBG("User event handle access is denied");
+                }
+                if (status == STATUS_INVALID_HANDLE) {
+                        KDBG("User event handle invalid");
+                }
+                hUserEvent = NULL;
+        } else {
+                KeSetEvent(pEvent, IO_NO_INCREMENT, FALSE);
+                ObDereferenceObject(pEvent);
+        }
+
 real:
         return RealZwCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 }
@@ -185,7 +213,7 @@ real:
 NTSTATUS NewZwOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
                           POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId)
 {
-        KDBG("Hijack success!\n");
+        KDBG("Hijack success!");
         return RealZwOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 }
 
@@ -200,8 +228,8 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING  Registr
 {
 	unsigned i;
 
-        KDBG("%s called\n", __FUNCTION__);
-	KDBG("Hello from RegHacker!\n");
+        KDBG("%s called", __FUNCTION__);
+	KDBG("Hello from RegHacker!");
 	
 	for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
 		DriverObject->MajorFunction[i] = RegHackerDefaultHandler;
@@ -217,14 +245,15 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING  Registr
 	DriverObject->DriverStartIo = NULL;
 	DriverObject->DriverExtension->AddDevice = RegHackerAddDevice;
 
-        KDBG("SSDT Driver has started\n");
+        KDBG("SSDT Driver has started");
 
         /* replace SSDT entries */
-        RealZwOpenProcess = (fnZwOpenProcess)(SYSTEMSERVICE(ZwOpenProcess));
-        (fnZwOpenProcess)(SYSTEMSERVICE(ZwOpenProcess)) = NewZwOpenProcess;
 
-        RealZwOpenKey = (fnZwOpenKey)(SYSTEMSERVICE(ZwOpenKey));
-        (fnZwOpenKey)(SYSTEMSERVICE(ZwOpenKey)) = NewZwOpenKey;
+        /* RealZwOpenProcess = (fnZwOpenProcess)(SYSTEMSERVICE(ZwOpenProcess)); */
+        /* (fnZwOpenProcess)(SYSTEMSERVICE(ZwOpenProcess)) = NewZwOpenProcess; */
+
+        /* RealZwOpenKey = (fnZwOpenKey)(SYSTEMSERVICE(ZwOpenKey)); */
+        /* (fnZwOpenKey)(SYSTEMSERVICE(ZwOpenKey)) = NewZwOpenKey; */
 
         RealZwCreateKey = (fnZwCreateKey)(SYSTEMSERVICE(ZwCreateKey));
         (fnZwCreateKey)(SYSTEMSERVICE(ZwCreateKey)) = NewZwCreateKey;
@@ -234,24 +263,24 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING  Registr
 
 void RegHackerUnload(IN PDRIVER_OBJECT DriverObject)
 {
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
         /* restore original SSDT entries */
-        (fnZwOpenProcess)(SYSTEMSERVICE(ZwOpenProcess)) = RealZwOpenProcess;
-        (fnZwOpenKey)(SYSTEMSERVICE(ZwOpenKey)) = RealZwOpenKey;
+        /* (fnZwOpenProcess)(SYSTEMSERVICE(ZwOpenProcess)) = RealZwOpenProcess; */
+        /* (fnZwOpenKey)(SYSTEMSERVICE(ZwOpenKey)) = RealZwOpenKey; */
         (fnZwCreateKey)(SYSTEMSERVICE(ZwCreateKey)) = RealZwCreateKey;
-	KDBG("Goodbye from RegHacker!\n");
+	KDBG("Goodbye from RegHacker!");
 }
 
 NTSTATUS RegHackerCreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
 	Irp->IoStatus.Status = STATUS_SUCCESS;
 	Irp->IoStatus.Information = 0;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS RegHackerIOControl(IN PDEVICE_OBJECT pDeviceObject, IN PIRP Irp)
+NTSTATUS RegHackerIOControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
         /* Universal verbose preparations */
         NTSTATUS status = STATUS_SUCCESS;
@@ -259,12 +288,13 @@ NTSTATUS RegHackerIOControl(IN PDEVICE_OBJECT pDeviceObject, IN PIRP Irp)
         ULONG cbin = stack->Parameters.DeviceIoControl.InputBufferLength;
         ULONG cbout = stack->Parameters.DeviceIoControl.OutputBufferLength;
         ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+        ULONG info = 0;
+        PRegHacker_DEVICE_EXTENSION pExt = (PRegHacker_DEVICE_EXTENSION)DeviceObject;
 
+        KDBG("%s called", __FUNCTION__);
+        KDBG("Entering ioctl");
 
-        KDBG("%s called\n", __FUNCTION__);
-        KDBG("Entering ioctl\n");
-
-        KDBG("address %p %p %p\n", RealZwOpenProcess, RealZwOpenKey, RealZwCreateKey);
+        KDBG("address %p %p %p", RealZwOpenProcess, RealZwOpenKey, RealZwCreateKey);
 
 
         status = STATUS_SUCCESS;
@@ -275,19 +305,23 @@ NTSTATUS RegHackerIOControl(IN PDEVICE_OBJECT pDeviceObject, IN PIRP Irp)
 
         switch (code) {
         case IOCTL_SET_EVENT:
-                /* /\* borrow from CSDN *\/ */
+                /* borrow from CSDN */
+                KDBG("IOCTL_SET_EVENT");
 
-                /* /\* retrieve user event *\/ */
-                /* HANDLE hUserEvent = *(HANDLE *)Irp->AssociatedIrp.SystemBuffer; */
+                /* retrieve user event */
+                hUserEvent = *(HANDLE *)Irp->AssociatedIrp.SystemBuffer;
 
-                /* /\* convert user handle into event object *\/ */
+                /* convert user handle into event object */
                 /* status = ObReferenceObjectByHandle(hUserEvent, EVENT_MODIFY_STATE, */
                 /*                                    *ExEventObjectType, KernelMode, */
-                /*                                    (PVOID*)&pDeviceObject->pEvent, */
+                /*                                    (PVOID *)&pEvent, */
                 /*                                    NULL); */
-                /* /\* make sure it is 0 *\/ */
-                /* KDBG("reference status = %d\n", status); */
-                /* break; */
+
+                /* make sure it is 0 */
+                /* KDBG("reference status = %d", status); */
+                /* ObDereferenceObject(pEvent); */
+
+                break;
         default:
                 status = STATUS_INVALID_VARIANT;
         }
@@ -295,16 +329,17 @@ NTSTATUS RegHackerIOControl(IN PDEVICE_OBJECT pDeviceObject, IN PIRP Irp)
         /* XXX The following steps are necessary or else
          * the userspace will definitely hang */
         Irp->IoStatus.Status = STATUS_SUCCESS;
-        /* Irp->IoStatus.Information */
+        Irp->IoStatus.Information = info;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_SUCCESS;
+
+        return status;
 }
 
 NTSTATUS RegHackerDefaultHandler(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 {
 	PRegHacker_DEVICE_EXTENSION deviceExtension = NULL;
 	
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
 	IoSkipCurrentIrpStackLocation(Irp);
 	deviceExtension = (PRegHacker_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
 	return IoCallDriver(deviceExtension->TargetDeviceObject, Irp);
@@ -318,7 +353,7 @@ NTSTATUS RegHackerAddDevice(IN PDRIVER_OBJECT  DriverObject, IN PDEVICE_OBJECT  
 
         UNICODE_STRING devName;
         UNICODE_STRING symLinkName;
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
 
         RtlInitUnicodeString(&devName,L"\\Device\\RegHackerDevice");
 
@@ -370,7 +405,7 @@ NTSTATUS RegHackerIrpCompletion(
 {
 	PKEVENT Event = (PKEVENT) Context;
 
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
 	UNREFERENCED_PARAMETER(DeviceObject);
 	UNREFERENCED_PARAMETER(Irp);
 
@@ -388,7 +423,7 @@ NTSTATUS RegHackerForwardIrpSynchronous(
 	KEVENT event;
 	NTSTATUS status;
 
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
 	deviceExtension = (PRegHacker_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
 
@@ -411,7 +446,7 @@ NTSTATUS RegHackerPnP(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 	PRegHacker_DEVICE_EXTENSION pExt = ((PRegHacker_DEVICE_EXTENSION)DeviceObject->DeviceExtension);
 	NTSTATUS status;
 
-        KDBG("%s called\n", __FUNCTION__);
+        KDBG("%s called", __FUNCTION__);
 	ASSERT(pExt);
 
 	switch (irpSp->MinorFunction)

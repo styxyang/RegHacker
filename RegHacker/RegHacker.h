@@ -45,4 +45,13 @@
     METHOD_BUFFERED,                            \
     FILE_ANY_ACCESS)
 
+typedef struct _deviceExtension
+{
+	PDEVICE_OBJECT DeviceObject;
+	PDEVICE_OBJECT TargetDeviceObject;
+	PDEVICE_OBJECT PhysicalDeviceObject;
+	UNICODE_STRING DeviceInterface;
+        HANDLE hUserEvent;
+} RegHacker_DEVICE_EXTENSION, *PRegHacker_DEVICE_EXTENSION;
+
 #endif /* _REGHACKER_H_ */
