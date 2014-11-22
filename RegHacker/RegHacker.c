@@ -136,8 +136,11 @@ NTSTATUS NewZwCreateKey(
         ULONG retLen, bufLen;
         PVOID buffer = NULL;
         NTSTATUS status;
-        ULONG idx;
+        LONG idx;
         ANSI_STRING aStr;
+        BOOLEAN skip = FALSE;
+        OBJECT_ATTRIBUTES objAttr;
+        UNICODE_STRING eventName;
 
         KDBG("Hijack ZwCreateKey");
 
@@ -169,12 +172,22 @@ NTSTATUS NewZwCreateKey(
         /* XXX buffer is already a pointer to a memory allocated by ExAllocatePool
          * no need to use `&' here ... */
         RtlUnicodeStringToAnsiString(&aStr, (PUNICODE_STRING)buffer, TRUE);
-        KDBG("%s\n", aStr.Buffer);
+
+        KDBG("Process: %s", aStr.Buffer);
+        idx = sizeof(processWhiteList)/sizeof(PCHAR);
+        while (--idx >= 0) {
+                if (aStr.Length ==
+                    RtlCompareMemory(aStr.Buffer, processWhiteList[idx], aStr.Length)) {
+                        skip = TRUE;
+                }
+        }
+
         RtlFreeAnsiString(&aStr);
         ExFreePool(buffer);
 
-        /* convert user handle into event object */
-        /* always use the ObReferenceObjectByHandle to access opaque object
+        /* convert user handle into event object
+         *
+         * always use the ObReferenceObjectByHandle to access opaque object
          * SHOULDN'T store it pEvent in an long-term-use variables
          * because the userspace may close the handle and reference it in kernel
          * will make you understand */
@@ -182,32 +195,67 @@ NTSTATUS NewZwCreateKey(
                 KDBG("User event handle not available");
                 goto real;
         }
+        if (TRUE == skip) {
+                KDBG("Skip whitelist entry");
+                goto real;
+        }
          /* Drivers should always specify *UserMode* for handles they receive
           * from user address space. -- From MSDN */
-        status = ObReferenceObjectByHandle(hUserEvent,
-                                           EVENT_MODIFY_STATE,
-                                           *ExEventObjectType,
-                                           UserMode,
-                                           (PVOID*)&pEvent,
+        KDBG("Before reference handle: %x", hUserEvent);
+        /* status = ObReferenceObjectByHandle(hUserEvent, */
+        /*                                    EVENT_MODIFY_STATE, */
+        /*                                    *ExEventObjectType, */
+        /*                                    UserMode, */
+        /*                                    (PVOID*)&pEvent, */
+        /*                                    NULL); */
+
+        /* RtlInitUnicodeString(&eventName, L"\\\\BaseNamedObjects\\RegNotify"); */
+        /* InitializeObjectAttributes(&objAttr, &eventName, */
+        /*                            OBJ_EXCLUSIVE | OBJ_INHERIT, */
+        /*                            NULL, NULL); */
+        /* status = ZwOpenEvent(hUserEvent, EVENT_MODIFY_STATE, &objAttr); */
+        /* if (STATUS_SUCCESS != status) { */
+        /*         KDBG("ZwOpenEvent fail %x", status); */
+        /*         goto real; */
+        /* } */
+        
+        RtlInitUnicodeString(&eventName, L"\\\\BaseNamedObjects\\RegNotify");
+        pEvent = IoCreateNotificationEvent(&eventName, &hUserEvent);
+        if (pEvent == NULL) {
+                KDBG("IoCreateNotificationEvent fail");
+                goto real;
+        }
+        status = ObReferenceObjectByHandle(hUserEvent, EVENT_MODIFY_STATE,
+                                           *ExEventObjectType, KernelMode,
+                                           (PVOID *)&pEvent,
                                            NULL);
+
         if (status != STATUS_SUCCESS) {
                 if (status == STATUS_OBJECT_TYPE_MISMATCH) {
                         KDBG("User event handle has wrong type");
                 }
-                if (status == STATUS_INVALID_HANDLE) {
+                if (status == STATUS_ACCESS_DENIED) {
                         KDBG("User event handle access is denied");
                 }
                 if (status == STATUS_INVALID_HANDLE) {
                         KDBG("User event handle invalid");
                 }
-                hUserEvent = NULL;
+                /* reset hUserEvent to prevent future bothering */
+                /* hUserEvent = NULL; */
         } else {
+                KDBG("Send message to userspace");
                 KeSetEvent(pEvent, IO_NO_INCREMENT, FALSE);
                 ObDereferenceObject(pEvent);
         }
 
 real:
-        return RealZwCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+        return RealZwCreateKey(KeyHandle,
+                               DesiredAccess,
+                               ObjectAttributes,
+                               TitleIndex,
+                               Class,
+                               CreateOptions,
+                               Disposition);
 }
 
 NTSTATUS NewZwOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
@@ -311,15 +359,31 @@ NTSTATUS RegHackerIOControl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
                 /* retrieve user event */
                 hUserEvent = *(HANDLE *)Irp->AssociatedIrp.SystemBuffer;
 
+                KDBG("hUserEvent: %x", hUserEvent);
                 /* convert user handle into event object */
-                /* status = ObReferenceObjectByHandle(hUserEvent, EVENT_MODIFY_STATE, */
-                /*                                    *ExEventObjectType, KernelMode, */
-                /*                                    (PVOID *)&pEvent, */
-                /*                                    NULL); */
+                status = ObReferenceObjectByHandle(hUserEvent, EVENT_MODIFY_STATE,
+                                                   *ExEventObjectType, KernelMode,
+                                                   (PVOID *)&pEvent,
+                                                   NULL);
 
                 /* make sure it is 0 */
-                /* KDBG("reference status = %d", status); */
-                /* ObDereferenceObject(pEvent); */
+                if (status != STATUS_SUCCESS) {
+                        if (status == STATUS_OBJECT_TYPE_MISMATCH) {
+                                KDBG("User event handle has wrong type");
+                        }
+                        if (status == STATUS_ACCESS_DENIED) {
+                                KDBG("User event handle access is denied");
+                        }
+                        if (status == STATUS_INVALID_HANDLE) {
+                                KDBG("User event handle invalid");
+                        }
+                        /* reset hUserEvent to prevent future bothering */
+                        /* hUserEvent = NULL; */
+                } else {
+                        KDBG("Reference succeed");
+                        /* KeSetEvent(pEvent, IO_NO_INCREMENT, FALSE); */
+                        ObDereferenceObject(pEvent);
+                }
 
                 break;
         default:

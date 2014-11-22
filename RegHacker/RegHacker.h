@@ -54,4 +54,13 @@ typedef struct _deviceExtension
         HANDLE hUserEvent;
 } RegHacker_DEVICE_EXTENSION, *PRegHacker_DEVICE_EXTENSION;
 
+static PCHAR processWhiteList[] = {
+        "\\Device\\HarddiskVolume1\\WINDOWS\\system32\\services.exe",
+        "\\Device\\HarddiskVolume1\\WINDOWS\\explorer.exe",
+        "\\Device\\HarddiskVolume1\\WINDOWS\\system32\\spoolsv.exe",
+        "\\Device\\HarddiskVolume1\\WINDOWS\\system32\\svchost.exe",
+        "\\Device\\HarddiskVolume1\\WINDOWS\\system32\\winlogon.exe",
+        "\\Device\\HarddiskVolume1\\WINDOWS\\system32\\cmd.exe",
+};
+
 #endif /* _REGHACKER_H_ */
